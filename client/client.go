@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -367,56 +368,96 @@ func QueryWebSocket(address, body string, headers map[string]string, config *Con
 	return true, msg[:n], nil
 }
 
-func QueryDNS(queryType, queryName, url string) (connected bool, dnsRcode string, body []byte, err error) {
+func QueryDNS(queryType, queryName, url string, fullBody bool, config *Config) (connected bool, dnsRcode string, body []byte, err error) {
 	if !strings.Contains(url, ":") {
 		url = fmt.Sprintf("%s:%d", url, dnsPort)
 	}
+
 	queryTypeAsUint16 := dns.StringToType[queryType]
-	c := new(dns.Client)
-	m := new(dns.Msg)
-	m.SetQuestion(queryName, queryTypeAsUint16)
-	r, _, err := c.Exchange(m, url)
+
+	client := new(dns.Client)
+	if config != nil {
+		client.Timeout = config.Timeout
+	}
+
+	message := new(dns.Msg)
+	message.SetQuestion(queryName, queryTypeAsUint16)
+	response, _, err := client.Exchange(message, url)
 	if err != nil {
 		logr.Infof("[client.QueryDNS] Error exchanging DNS message: %v", err)
 		return false, "", nil, err
 	}
-	connected = true
-	dnsRcode = dns.RcodeToString[r.Rcode]
-	for _, rr := range r.Answer {
-		switch rr.Header().Rrtype {
-		case dns.TypeA:
-			if a, ok := rr.(*dns.A); ok {
-				body = []byte(a.A.String())
-			}
-		case dns.TypeAAAA:
-			if aaaa, ok := rr.(*dns.AAAA); ok {
-				body = []byte(aaaa.AAAA.String())
-			}
-		case dns.TypeCNAME:
-			if cname, ok := rr.(*dns.CNAME); ok {
-				body = []byte(cname.Target)
-			}
-		case dns.TypeMX:
-			if mx, ok := rr.(*dns.MX); ok {
-				body = []byte(mx.Mx)
-			}
-		case dns.TypeNS:
-			if ns, ok := rr.(*dns.NS); ok {
-				body = []byte(ns.Ns)
-			}
-		case dns.TypePTR:
-			if ptr, ok := rr.(*dns.PTR); ok {
-				body = []byte(ptr.Ptr)
-			}
-		case dns.TypeSRV:
-			if srv, ok := rr.(*dns.SRV); ok {
-				body = []byte(fmt.Sprintf("%s:%d", srv.Target, srv.Port))
-			}
-		default:
-			body = []byte("query type is not supported yet")
-		}
+
+	var answerMaps []map[string]any
+	{
+		answerJsonBytes, _ := json.Marshal(response.Answer)
+		json.Unmarshal(answerJsonBytes, &answerMaps)
 	}
-	return connected, dnsRcode, body, nil
+
+	for _, rAnswerMap := range answerMaps {
+		hdrMap := rAnswerMap["Hdr"].(map[string]any)
+
+		answers := make([]string, 0)
+
+		rrType := dns.Type(hdrMap["Rrtype"].(float64)).String()
+		rrTypeKey := strings.ToUpper(rrType[0:1]) + strings.ToLower(rrType[1:])
+		answer := rAnswerMap[rrTypeKey]
+		if answer == nil {
+			answer = rAnswerMap[strings.ToUpper(rrTypeKey)]
+		}
+		if answer == nil {
+			answer = rAnswerMap["Target"]
+		}
+		if answer != nil {
+			switch answerType := answer.(type) {
+			case []any:
+				for _, a := range answer.([]any) {
+					answers = append(answers, a.(string))
+				}
+			case string:
+				answers = append(answers, answer.(string))
+			default:
+				_ = answerType
+			}
+		}
+
+		rAnswerMap["Answer"] = strings.Join(answers, " ")
+		rAnswerMap["Ttl"] = hdrMap["Ttl"].(float64)
+		delete(rAnswerMap, "Hdr")
+	}
+
+	// response.Answer is random => sort to make it consistent
+	slices.SortStableFunc(answerMaps, func(itemA, itemB map[string]any) int {
+		result := 0
+		if result == 0 && itemA["Priority"] != nil {
+			result = int(itemA["Priority"].(float64) - itemB["Priority"].(float64))
+		}
+		if result == 0 && itemA["Preference"] != nil {
+			result = int(itemA["Preference"].(float64) - itemB["Preference"].(float64))
+		}
+		if result == 0 {
+			result = strings.Compare(itemA["Answer"].(string), itemB["Answer"].(string))
+		}
+		return result
+	})
+
+	dnsRcode = dns.RcodeToString[response.Rcode]
+
+	if !fullBody {
+		if len(answerMaps) <= 0 {
+			return true, dnsRcode, nil, nil
+		}
+		firstAnswer := answerMaps[0]
+		bodyString := firstAnswer["Answer"].(string)
+		if queryTypeAsUint16 == dns.TypeSRV {
+			// Backward compatibility
+			bodyString = fmt.Sprintf("%v:%v", firstAnswer["Target"], firstAnswer["Port"])
+		}
+		return true, dnsRcode, []byte(bodyString), nil
+	}
+
+	answerMapsJsonBytes, _ := json.Marshal(answerMaps)
+	return true, dnsRcode, answerMapsJsonBytes, nil
 }
 
 // InjectHTTPClient is used to inject a custom HTTP client for testing purposes

@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
@@ -10,7 +12,6 @@ import (
 	"time"
 
 	"github.com/TwiN/gatus/v5/config/endpoint/dns"
-	"github.com/TwiN/gatus/v5/pattern"
 	"github.com/TwiN/gatus/v5/test"
 )
 
@@ -360,12 +361,13 @@ func TestTlsRenegotiation(t *testing.T) {
 
 func TestQueryDNS(t *testing.T) {
 	scenarios := []struct {
-		name            string
-		inputDNS        dns.Config
-		inputURL        string
-		expectedDNSCode string
-		expectedBody    string
-		isErrExpected   bool
+		name             string
+		inputDNS         dns.Config
+		inputURL         string
+		expectedDNSCode  string
+		expectedBody     string
+		expectedFullBody []map[string]string
+		isErrExpected    bool
 	}{
 		{
 			name: "test Config with type A",
@@ -376,6 +378,11 @@ func TestQueryDNS(t *testing.T) {
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
 			expectedBody:    "__IPV4__",
+			expectedFullBody: []map[string]string{
+				{"Answer": "__IPV4__"},
+				{"Answer": "__IPV4__"},
+				{"Answer": "__IPV4__"},
+			},
 		},
 		{
 			name: "test Config with type AAAA",
@@ -386,6 +393,11 @@ func TestQueryDNS(t *testing.T) {
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
 			expectedBody:    "__IPV6__",
+			expectedFullBody: []map[string]string{
+				{"Answer": "__IPV6__"},
+				{"Answer": "__IPV6__"},
+				{"Answer": "__IPV6__"},
+			},
 		},
 		{
 			name: "test Config with type CNAME",
@@ -396,6 +408,9 @@ func TestQueryDNS(t *testing.T) {
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
 			expectedBody:    "dyna.wikimedia.org.",
+			expectedFullBody: []map[string]string{
+				{"Answer": "dyna.wikimedia.org."},
+			},
 		},
 		{
 			name: "test Config with type MX",
@@ -406,6 +421,36 @@ func TestQueryDNS(t *testing.T) {
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
 			expectedBody:    ".",
+			expectedFullBody: []map[string]string{
+				{"Answer": ".", "Preference": "0"},
+			},
+		},
+		{
+			name: "test Config with type TXT",
+			inputDNS: dns.Config{
+				QueryType: "TXT",
+				QueryName: "example.com.",
+			},
+			inputURL:        "8.8.8.8",
+			expectedDNSCode: "NOERROR",
+			expectedBody:    "_k2n1y4vw3qtb4skdx9e7dxt97qrmmq9",
+			expectedFullBody: []map[string]string{
+				{"Answer": "_k2n1y4vw3qtb4skdx9e7dxt97qrmmq9"},
+				{"Answer": "v=spf1 -all"},
+			},
+		},
+		{
+			name: "test Config with type SRV",
+			inputDNS: dns.Config{
+				QueryType: "SRV",
+				QueryName: "_imaps._tcp.gmail.com.",
+			},
+			inputURL:        "8.8.8.8",
+			expectedDNSCode: "NOERROR",
+			expectedBody:    "imap.gmail.com.:993",
+			expectedFullBody: []map[string]string{
+				{"Target": "imap.gmail.com.", "Port": "993"},
+			},
 		},
 		{
 			name: "test Config with type NS",
@@ -415,7 +460,11 @@ func TestQueryDNS(t *testing.T) {
 			},
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
-			expectedBody:    "*.iana-servers.net.",
+			expectedBody:    "a.iana-servers.net.",
+			expectedFullBody: []map[string]string{
+				{"Answer": "a.iana-servers.net."},
+				{"Answer": "b.iana-servers.net."},
+			},
 		},
 		{
 			name: "test Config with type PTR",
@@ -426,6 +475,9 @@ func TestQueryDNS(t *testing.T) {
 			inputURL:        "8.8.8.8",
 			expectedDNSCode: "NOERROR",
 			expectedBody:    "dns.google.",
+			expectedFullBody: []map[string]string{
+				{"Answer": "dns.google."},
+			},
 		},
 		{
 			name: "test Config with fake type and retrieve error",
@@ -438,42 +490,63 @@ func TestQueryDNS(t *testing.T) {
 		},
 	}
 	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			_, dnsRCode, body, err := QueryDNS(scenario.inputDNS.QueryType, scenario.inputDNS.QueryName, scenario.inputURL)
-			if scenario.isErrExpected && err == nil {
-				t.Errorf("there should be an error")
+		for _, fullBody := range []bool{false, true} {
+			testName := scenario.name
+			if fullBody {
+				testName = testName + " with full body"
 			}
-			if dnsRCode != scenario.expectedDNSCode {
-				t.Errorf("expected DNSRCode to be %s, got %s", scenario.expectedDNSCode, dnsRCode)
-			}
-			if scenario.inputDNS.QueryType == "NS" {
-				// Because there are often multiple nameservers backing a single domain, we'll only look at the suffix
-				if !pattern.Match(scenario.expectedBody, string(body)) {
-					t.Errorf("got %s, expected result %s,", string(body), scenario.expectedBody)
+			t.Run(testName, func(t *testing.T) {
+				_, dnsRCode, body, err := QueryDNS(scenario.inputDNS.QueryType, scenario.inputDNS.QueryName, scenario.inputURL, fullBody, &Config{Timeout: 5 * time.Second})
+				if scenario.isErrExpected && err == nil {
+					t.Errorf("there should be an error")
 				}
-			} else {
-				if string(body) != scenario.expectedBody {
-					// little hack to validate arbitrary ipv4/ipv6
+				if dnsRCode != scenario.expectedDNSCode {
+					t.Errorf("expected DNSRCode to be '%s', got '%s'", scenario.expectedDNSCode, dnsRCode)
+				}
+				if fullBody {
+					var bodyMaps []map[string]any
+					json.Unmarshal(body, &bodyMaps)
+					for i, expectedBodyMap := range scenario.expectedFullBody {
+						for expectedBodyKey, expectedBodyValue := range expectedBodyMap {
+							bodyValue := fmt.Sprintf("%v", bodyMaps[i][expectedBodyKey])
+							if bodyValue != expectedBodyValue {
+								switch scenario.expectedBody {
+								case "__IPV4__":
+									expectValidIPv4(t, bodyValue)
+								case "__IPV6__":
+									expectValidIPv6(t, bodyValue)
+								default:
+									t.Errorf("got bodyMaps[%d][%s]='%v', expected result '%v'", i, expectedBodyKey, bodyValue, expectedBodyValue)
+								}
+							}
+						}
+					}
+				} else if string(body) != scenario.expectedBody {
 					switch scenario.expectedBody {
 					case "__IPV4__":
-						if addr, err := netip.ParseAddr(string(body)); err != nil {
-							t.Errorf("got %s, expected result %s", string(body), scenario.expectedBody)
-						} else if !addr.Is4() {
-							t.Errorf("got %s, expected valid IPv4", string(body))
-						}
+						expectValidIPv4(t, string(body))
 					case "__IPV6__":
-						if addr, err := netip.ParseAddr(string(body)); err != nil {
-							t.Errorf("got %s, expected result %s", string(body), scenario.expectedBody)
-						} else if !addr.Is6() {
-							t.Errorf("got %s, expected valid IPv6", string(body))
-						}
+						expectValidIPv6(t, string(body))
 					default:
-						t.Errorf("got %s, expected result %s", string(body), scenario.expectedBody)
+						t.Errorf("got '%s', expected result '%s'", string(body), scenario.expectedBody)
 					}
 				}
-			}
-		})
-		time.Sleep(10 * time.Millisecond)
+			})
+		}
+	}
+}
+
+func expectValidIPv4(t *testing.T, value string) {
+	addr, err := netip.ParseAddr(value)
+	if err != nil || !addr.Is4() {
+		t.Errorf("got '%s', expected valid IPv4", value)
+	}
+}
+
+func expectValidIPv6(t *testing.T, value string) {
+	addr, err := netip.ParseAddr(value)
+	if err != nil || !addr.Is6() {
+		t.Errorf("got '%s', expected valid IPv6", value)
 	}
 }
 
