@@ -378,7 +378,7 @@ func (e *Endpoint) call(result *Result) {
 	}
 	startTime := time.Now()
 	if endpointType == TypeDNS {
-		result.Connected, result.DNSRCode, result.Body, err = client.QueryDNS(e.DNSConfig.QueryType, e.DNSConfig.QueryName, e.URL)
+		result.Connected, result.DNSRCode, result.Body, err = client.QueryDNS(e.DNSConfig.QueryType, e.DNSConfig.QueryName, e.URL, e.DNSConfig.FullBody, e.ClientConfig)
 		if err != nil {
 			result.AddError(err.Error())
 			return
