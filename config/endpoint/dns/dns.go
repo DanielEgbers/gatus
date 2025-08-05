@@ -22,6 +22,9 @@ type Config struct {
 
 	// QueryName is the query for DNS
 	QueryName string `yaml:"query-name"`
+
+	// FullBody defines whether the full body with multiple answers (as json array) should be returned or just a single value with the presumed main answer (as string)
+	FullBody bool `yaml:"full-body"`
 }
 
 func (d *Config) ValidateAndSetDefault() error {
