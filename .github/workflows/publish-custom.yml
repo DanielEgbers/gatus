@@ -17,6 +17,8 @@ on:
 jobs:
   publish-custom:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
